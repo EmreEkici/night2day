@@ -1,0 +1,7 @@
+Model 0: Oran 1e1, Generator 14 katman, Epoch: 100, Batch: 32
+Model 1: Oran 5e1, Generator 14 katman, Epoch: 100, Batch: 32
+Model 2: Oran 5e1, Generator 14 katman, Epoch: 500, Batch: 32
+Model 3: Oran 5e1, Generator 14(x2) katman, Epoch: 500, Batch: 8
+Model 4: Oran 5e1, Generator 16(x2)(3->783->3) katman, Epoch: 500, Batch: 8
+Model 5: Oran 5e1, Generator 18(x2)(3->1024->3) katman, Epoch: 500, Batch: 8
+Model 6: 

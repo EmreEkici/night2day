@@ -1,0 +1,200 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.optim.lr_scheduler as scheduler
+from torchvision.utils import save_image
+import numpy as np
+
+from generator import define_G
+from discriminator import define_D
+from loss import define_GAN_loss
+from image_pool import ImagePool
+
+##############
+model_num = 0
+##############
+
+def create_model():
+    print("Creating the model...")
+    model = CycleGANModel()
+
+    return model
+
+def create_parallel_model(gpu_ids):
+    print("Creating the parallel model...")
+    model = CycleGANParallel(gpu_ids)
+
+    return model
+
+def load_model(name):
+    print("Loading", name, "...")
+    model = CycleGANModel()
+    model.name = name
+    model.load_state_dict(torch.load("./checkpoints/checkpoints_"+str(model_num)+"/" + name))
+
+    return model
+
+def save_model(model, name):
+    print("Saving the model...")
+    torch.save(model.state_dict(), "./checkpoints/checkpoints_"+str(model_num)+"/" + name)
+
+def move_model_to_GPU(model):
+    device = "cpu"
+    if torch.cuda.is_available():
+        print("Moving the model to GPU...")
+        device = "cuda:0"
+        model.to(device)
+
+    return model, device
+
+class CycleGANModel(nn.Module):
+    def __init__(self, num_iter=100, num_iter_decay=100, lambda_A=10, lambda_B=10, lambda_identity=0.5):
+        super(CycleGANModel, self).__init__()
+        self.name = None
+
+        self.epoch_count = torch.tensor(1) ###
+        self.num_iter = torch.tensor(num_iter)
+        self.num_iter_decay = torch.tensor(num_iter_decay)
+
+        self.lambda_A = torch.tensor(lambda_A)
+        self.lambda_B = torch.tensor(lambda_B)
+        self.lambda_identity = torch.tensor(lambda_identity)
+
+        self.netG_A = define_G(num_res_blocks=9)
+        self.netG_B = define_G(num_res_blocks=9)
+
+        self.netD_A = define_D()
+        self.netD_B = define_D()
+
+        self.fake_A_pool = ImagePool(pool_size=50)
+        self.fake_B_pool = ImagePool(pool_size=50)
+
+        self.criterionGAN = define_GAN_loss()
+        self.criterionCycle = torch.nn.L1Loss()
+        self.criterionIdt = torch.nn.L1Loss()
+
+        self.optimizer_G_A = optim.Adam(self.netG_A.parameters(), lr=0.0002, betas=(0.5, 0.999))
+        self.optimizer_G_B = optim.Adam(self.netG_B.parameters(), lr=0.0002, betas=(0.5, 0.999))
+        self.optimizer_D_A = optim.Adam(self.netD_A.parameters(), lr=0.0002, betas=(0.5, 0.999))
+        self.optimizer_D_B = optim.Adam(self.netD_B.parameters(), lr=0.0002, betas=(0.5, 0.999))
+
+        lambda_rule = lambda epoch: 1.0 - max(0, epoch + self.epoch_count - self.num_iter) / float(self.num_iter_decay + 1)
+
+        self.scheduler_G_A = scheduler.LambdaLR(self.optimizer_G_A, lr_lambda=lambda_rule)
+        self.scheduler_G_B = scheduler.LambdaLR(self.optimizer_G_B, lr_lambda=lambda_rule)
+        self.scheduler_D_A = scheduler.LambdaLR(self.optimizer_D_A, lr_lambda=lambda_rule)
+        self.scheduler_D_B = scheduler.LambdaLR(self.optimizer_D_B, lr_lambda=lambda_rule)
+
+    def set_input(self, batch_A, batch_B):
+        self.real_A = batch_A
+        self.real_B = batch_B
+
+    def forward(self):
+        self.fake_B = self.netG_A(self.real_A)  
+        self.rec_A = self.netG_B(self.fake_B) 
+        self.fake_A = self.netG_B(self.real_B)  
+        self.rec_B = self.netG_A(self.fake_A)
+
+    def save_images(self, iter_count, batch_size):
+        path = "./datasets/night2day/test_results/test_results_"+str(model_num)+"/"
+
+        for i in range(batch_size):
+            img_num = (iter_count) * batch_size + i
+
+            fake_A_numpy = self.fake_A[i].data.cpu().numpy()
+            real_A_numpy = self.real_A[i].data.cpu().numpy()
+            rec_A_numpy = self.rec_A[i].data.cpu().numpy()
+            fake_B_numpy = self.fake_B[i].data.cpu().numpy()
+            real_B_numpy = self.real_B[i].data.cpu().numpy()
+            rec_B_numpy = self.rec_B[i].data.cpu().numpy()
+            
+            image = np.concatenate((fake_A_numpy, real_A_numpy, rec_A_numpy, fake_B_numpy, real_B_numpy, rec_B_numpy), 2) # 2?
+
+            save_image(torch.from_numpy(image).squeeze()/2+0.5, path+self.name+"_"+str(img_num)+'.png', nrow=batch_size)
+
+    def backward_D_basic(self, netD, real, fake):
+        pred_real = netD(real)
+        loss_D_real = self.criterionGAN(pred_real, True)
+
+        pred_fake = netD(fake.detach()) # !
+        loss_D_fake = self.criterionGAN(pred_fake, False)
+
+        loss_D = (loss_D_real + loss_D_fake) * 0.5
+        loss_D.backward()
+        
+        return loss_D
+
+    def backward_D_A(self):
+        fake_B = self.fake_B_pool.query(self.fake_B)
+        self.loss_D_A = self.backward_D_basic(self.netD_A, self.real_B, fake_B)
+
+    def backward_D_B(self):
+        fake_A = self.fake_A_pool.query(self.fake_A)
+        self.loss_D_B = self.backward_D_basic(self.netD_B, self.real_A, fake_A)
+
+    def backward_G(self):
+        lambda_idt = self.lambda_identity
+        lambda_A = self.lambda_A
+        lambda_B = self.lambda_B
+ 
+        if lambda_idt > 0:
+            self.idt_A = self.netG_A(self.real_B)
+            self.loss_idt_A = self.criterionIdt(self.idt_A, self.real_B) * lambda_B * lambda_idt
+
+            self.idt_B = self.netG_B(self.real_A)
+            self.loss_idt_B = self.criterionIdt(self.idt_B, self.real_A) * lambda_A * lambda_idt
+        else:
+            self.loss_idt_A = 0
+            self.loss_idt_B = 0
+
+        self.loss_G_A = self.criterionGAN(self.netD_A(self.fake_B), True)
+        self.loss_G_B = self.criterionGAN(self.netD_B(self.fake_A), True)
+        self.loss_cycle_A = self.criterionCycle(self.rec_A, self.real_A) * lambda_A
+        self.loss_cycle_B = self.criterionCycle(self.rec_B, self.real_B) * lambda_B
+
+        self.loss_G = self.loss_G_A + self.loss_G_B + self.loss_cycle_A + self.loss_cycle_B + self.loss_idt_A + self.loss_idt_B
+        self.loss_G.backward()
+
+    def set_requires_grad(self, nets, requires_grad=False):
+        for net in nets:
+            for param in net.parameters():
+                param.requires_grad = requires_grad
+
+    def optimize_parameters(self):
+        self.forward() 
+
+        self.set_requires_grad([self.netD_A, self.netD_B], False)
+        self.optimizer_G_A.zero_grad()
+        self.optimizer_G_B.zero_grad()  
+        self.backward_G()             
+        self.optimizer_G_A.step()
+        self.optimizer_G_B.step()        
+
+        self.set_requires_grad([self.netD_A, self.netD_B], True)
+        self.optimizer_D_A.zero_grad()
+        self.optimizer_D_B.zero_grad()     
+        self.backward_D_A()      
+        self.backward_D_B()      
+        self.optimizer_D_A.step()
+        self.optimizer_D_B.step()
+
+        self.loss_D = self.loss_D_A + self.loss_D_B
+
+    def update_learning_rates(self):
+        self.scheduler_G_A.step()
+        self.scheduler_G_B.step()
+        self.scheduler_D_A.step()
+        self.scheduler_D_B.step()
+
+    def get_current_losses(self):
+        return self.loss_G.item(), self.loss_D.item()
+
+
+class CycleGANParallel(CycleGANModel):
+    def __init__(self, gpu_ids, num_iter=100, num_iter_decay=100, lambda_A=10, lambda_B=10, lambda_identity=0.5):
+        super(CycleGANModel, self).__init__()
+        self.gpu_ids = gpu_ids
+        self.model = CycleGANModel(num_iter=100, num_iter_decay=100, lambda_A=10, lambda_B=10, lambda_identity=0.5).cuda()
+
+    def forward(self, x):
+        return nn.parallel.data_parallel(self.model, x, device_ids=self.gpu_ids)
